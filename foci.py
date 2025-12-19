@@ -1,403 +1,388 @@
 import numpy as np
 import matplotlib.pyplot as plt
-from matplotlib.widgets import Button, Slider, RadioButtons
-from matplotlib.backend_bases import MouseButton
+from mpl_toolkits.mplot3d import Axes3D
+import streamlit as st
+import plotly.graph_objects as go
 
+# ==================== PAGE CONFIGURATION ====================
+# Must be the very first Streamlit command
+st.set_page_config(page_title="Ultimate Conics Generator", layout="wide")
+
+# CSS to prevent page scroll jumping
+# 1. Enforce a minimum height for the plotly chart container so the page doesn't collapse during calc.
+# 2. Adjust padding to maximize screen real estate.
+st.markdown("""
+    <style>
+        .stPlotlyChart {
+            min-height: 700px;
+        }
+        .main .block-container {
+            padding-top: 2rem;
+            padding-bottom: 2rem;
+        }
+    </style>
+""", unsafe_allow_html=True)
+
+# Check for 3D dependencies
 try:
     from skimage import measure
     HAS_SKIMAGE = True
 except ImportError:
     HAS_SKIMAGE = False
-    print("Warning: scikit-image not found. Install with: pip install scikit-image")
-    print("3D modes will be disabled.")
 
+# Initialize session state for foci
+if 'foci' not in st.session_state:
+    st.session_state.foci = []
+if 'k_val' not in st.session_state:
+    st.session_state.k_val = 5.0
 
-class UltimateConicsApp:
-    def __init__(self):
-        self.foci = []  # List of [x, y, sign]
-        self.mode = '2D'
-        self.metric = 'Euclidean'
-        
-        # Metric parameters
-        self.p_val = 2.0      # Minkowski p
-        self.angular_n = 3    # Angular: number of petals
-        self.angular_a = 0.3  # Angular: amplitude
-        
-        self.dragging_idx = -1
-        
-        # Grid Resolutions
-        self.res_high, self.res_low, self.res_3d = 400, 40, 40
-        self._setup_grids()
+# ==================== CORE MATHEMATICS ====================
 
-        # Create figure
-        self.fig = plt.figure(figsize=(14, 8))
-        
-        # Create BOTH 2D and 3D axes upfront, hide one
-        self.ax_2d = self.fig.add_axes([0.2, 0.15, 0.75, 0.8])
-        self.ax_3d = self.fig.add_axes([0.2, 0.15, 0.75, 0.8], projection='3d')
-        
-        # Start with 2D visible
-        self.ax_3d.set_visible(False)
-        self.ax = self.ax_2d
-        
-        self._setup_2d_axes()
-        self._setup_3d_axes()
-        
-        self.curve_artists = []
-        self.preview_artists = []
-        self.focus_artists = []
-        
-        # Create UI elements
-        self._init_ui()
-        
-        self.fig.canvas.mpl_connect('button_press_event', self.on_click)
-        self.fig.canvas.mpl_connect('button_release_event', self.on_release)
-        self.fig.canvas.mpl_connect('motion_notify_event', self.on_motion)
-        
-        plt.show()
+def get_dist(dx, dy, dz, metric, p_val, angular_n, angular_a):
+    """Vectorized distance calculation based on selected metric."""
+    if metric == 'Euclidean':
+        return np.sqrt(dx**2 + dy**2 + dz**2)
+    elif metric == 'Manhattan':
+        return np.abs(dx) + np.abs(dy) + np.abs(dz)
+    elif metric == 'Chebyshev':
+        return np.maximum(np.maximum(np.abs(dx), np.abs(dy)), np.abs(dz))
+    elif metric == 'Minkowski':
+        # Protect against negative bases for fractional powers
+        return (np.abs(dx)**p_val + np.abs(dy)**p_val + np.abs(dz)**p_val)**(1/p_val)
+    elif metric == 'Angular':
+        r = np.sqrt(dx**2 + dy**2 + dz**2)
+        theta = np.arctan2(dy, dx)
+        return r * (1 + angular_a * np.cos(angular_n * theta))
+    return 0
 
-    def _setup_grids(self):
-        l_h = np.linspace(-10, 10, self.res_high)
-        self.X_h, self.Y_h = np.meshgrid(l_h, l_h)
-        l_l = np.linspace(-10, 10, self.res_low)
-        self.X_l, self.Y_l = np.meshgrid(l_l, l_l)
-        l_3 = np.linspace(-10, 10, self.res_3d)
-        self.X3, self.Y3, self.Z3 = np.meshgrid(l_3, l_3, l_3, indexing='ij')
+def compute_field_2d(foci, X, Y, metric, p_val, angular_n, angular_a):
+    if not foci: return None
+    field = np.zeros_like(X)
+    for fx, fy, sign in foci:
+        dist = get_dist(X - fx, Y - fy, 0, metric, p_val, angular_n, angular_a)
+        field += sign * dist
+    return field
 
-    def _setup_2d_axes(self):
-        """Configure the 2D axes."""
-        self.ax_2d.set_xlim(-10, 10)
-        self.ax_2d.set_ylim(-10, 10)
-        self.ax_2d.set_aspect('equal')
-        self.ax_2d.grid(True, alpha=0.2)
+def compute_field_3d(foci, X, Y, Z, metric, p_val, angular_n, angular_a, mode):
+    if not foci: return None
+    field = np.zeros_like(X)
+    for fx, fy, sign in foci:
+        dz = Z if mode == '3D Constant' else 0
+        dist = get_dist(X - fx, Y - fy, dz, metric, p_val, angular_n, angular_a)
+        field += sign * dist
+    return field
 
-    def _setup_3d_axes(self):
-        """Configure the 3D axes."""
-        self.ax_3d.set_xlim(-10, 10)
-        self.ax_3d.set_ylim(-10, 10)
-        self.ax_3d.set_zlim(-10, 10)
+def auto_constant(foci):
+    if len(foci) <= 1: return 5.0
+    f_arr = np.array(foci)
+    dx = f_arr[:, 0, None] - f_arr[:, 0]
+    dy = f_arr[:, 1, None] - f_arr[:, 1]
+    dist_matrix = np.sqrt(dx**2 + dy**2)
+    max_d = np.max(dist_matrix)
+    if any(f[2] < 0 for f in foci):
+        return max_d * 0.4 if max_d > 0 else 2.0
+    return max_d * 1.2 if max_d > 0 else 5.0
 
-    def _switch_axes(self):
-        """Switch between 2D and 3D axes by showing/hiding."""
-        self.clear_artists(self.curve_artists)
-        self.clear_artists(self.preview_artists)
-        self.clear_artists(self.focus_artists)
-        
-        if self.mode == '2D':
-            self.ax_3d.set_visible(False)
-            self.ax_2d.set_visible(True)
-            self.ax = self.ax_2d
-            self.ax_2d.clear()
-            self._setup_2d_axes()
-        else:
-            self.ax_2d.set_visible(False)
-            self.ax_3d.set_visible(True)
-            self.ax = self.ax_3d
-            while self.ax_3d.collections:
-                self.ax_3d.collections[0].remove()
-            while self.ax_3d.lines:
-                self.ax_3d.lines[0].remove()
-            while self.ax_3d.texts:
-                self.ax_3d.texts[0].remove()
-            self._setup_3d_axes()
-        
-        self.update_foci_ui()
-        self.fig.canvas.draw_idle()
+# ==================== GEOMETRY GENERATORS (PLOTLY) ====================
 
-    def _get_dist(self, dx, dy, dz=0):
-        if self.metric == 'Euclidean':
-            return np.sqrt(dx**2 + dy**2 + dz**2)
-        if self.metric == 'Manhattan':
-            return np.abs(dx) + np.abs(dy) + np.abs(dz)
-        if self.metric == 'Chebyshev':
-            return np.maximum(np.maximum(np.abs(dx), np.abs(dy)), np.abs(dz))
-        if self.metric == 'Minkowski':
-            p = self.p_val
-            return (np.abs(dx)**p + np.abs(dy)**p + np.abs(dz)**p)**(1/p)
-        if self.metric == 'Angular':
-            r = np.sqrt(dx**2 + dy**2 + dz**2)
-            n = self.angular_n
-            a = self.angular_a
-            return r * (1 + a * np.cos(n * np.arctan2(dy, dx)))
-        return 0
+def get_2d_contour_traces(foci, constant, metric, p_val, angular_n, angular_a, resolution):
+    """Generates Plotly traces for 2D contours using matplotlib backend for calculation."""
+    traces = []
+    if not foci: return traces
 
-    def compute_field(self, grid_type='high'):
-        if not self.foci:
-            return None
-        f_arr = np.array(self.foci)
-        
-        if self.mode == '2D':
-            X, Y = (self.X_l, self.Y_l) if grid_type == 'low' else (self.X_h, self.Y_h)
-            fx = f_arr[:, 0, None, None]
-            fy = f_arr[:, 1, None, None]
-            fs = f_arr[:, 2, None, None]
-            return np.sum(self._get_dist(X - fx, Y - fy) * fs, axis=0)
-        else:
-            fx = f_arr[:, 0, None, None, None]
-            fy = f_arr[:, 1, None, None, None]
-            fs = f_arr[:, 2, None, None, None]
-            dz = self.Z3 if self.mode == '3D Constant' else 0
-            return np.sum(self._get_dist(self.X3 - fx, self.Y3 - fy, dz) * fs, axis=0)
-
-    def auto_constant(self, event=None):
-        if len(self.foci) < 1:
-            return
-        f_arr = np.array(self.foci)
-        if len(self.foci) == 1:
-            self.s_const.set_val(5.0)
-        else:
-            dx = f_arr[:, 0, None] - f_arr[:, 0]
-            dy = f_arr[:, 1, None] - f_arr[:, 1]
-            dist_matrix = np.sqrt(dx**2 + dy**2)
-            max_d = np.max(dist_matrix)
-            
-            if any(f[2] < 0 for f in self.foci):
-                self.s_const.set_val(max_d * 0.4 if max_d > 0 else 2.0)
-            else:
-                self.s_const.set_val(max_d * 1.2 if max_d > 0 else 5.0)
-        self.generate(quality='high')
-
-    def clear_artists(self, artist_list):
-        while artist_list:
-            art = artist_list.pop()
-            try:
-                art.remove()
-            except:
-                pass
-
-    def generate(self, event=None, quality='high'):
-        target_list = self.preview_artists if quality == 'low' else self.curve_artists
-        self.clear_artists(target_list)
-        
-        if quality == 'high':
-            self.clear_artists(self.preview_artists)
-
-        field = self.compute_field(grid_type=quality)
-        if field is None:
-            self.fig.canvas.draw_idle()
-            return
-
-        val = self.s_const.val
-        
-        if self.mode == '2D':
-            X, Y = (self.X_l, self.Y_l) if quality == 'low' else (self.X_h, self.Y_h)
-            
-            levels = sorted(set([val, -val])) if any(f[2] < 0 for f in self.foci) else [val]
-            cs = self.ax.contour(X, Y, field, levels=levels,
-                                 colors=['#2ca02c', '#9467bd'],
-                                 linewidths=(1 if quality == 'low' else 2.5))
-            
-            target_list.append(cs)
-        
-        elif quality == 'high' and HAS_SKIMAGE:
-            try:
-                if self.mode == '3D Variable':
-                    target = field - self.Z3
-                    iso_levels = [0]
-                else:
-                    target = field
-                    iso_levels = [val, -val] if any(f[2] < 0 for f in self.foci) else [val]
-                
-                cmaps = ['viridis', 'plasma']
-                spacing = (20 / self.res_3d,) * 3
-                
-                for i, iso in enumerate(iso_levels):
-                    try:
-                        verts, faces, _, _ = measure.marching_cubes(target, iso, spacing=spacing)
-                        verts = verts - 10
-                        surf = self.ax.plot_trisurf(
-                            verts[:, 0], verts[:, 1], verts[:, 2],
-                            triangles=faces, cmap=cmaps[i % 2], alpha=0.6, lw=0
-                        )
-                        target_list.append(surf)
-                    except (ValueError, RuntimeError):
-                        pass
-            except Exception as e:
-                print(f"3D generation error: {e}")
-        
-        self.fig.canvas.draw_idle()
-
-    def on_click(self, event):
-        if event.inaxes != self.ax or self.mode != '2D':
-            return
-        if event.xdata is None or event.ydata is None:
-            return
-            
-        for i, (fx, fy, _) in enumerate(self.foci):
-            if np.hypot(event.xdata - fx, event.ydata - fy) < 0.6:
-                if event.button == MouseButton.RIGHT:
-                    self.foci[i][2] *= -1
-                    self.update_foci_ui()
-                    self.generate(quality='low')
-                else:
-                    self.dragging_idx = i
-                return
-                
-        if event.button == MouseButton.LEFT:
-            self.foci.append([event.xdata, event.ydata, 1])
-            self.update_foci_ui()
-            self.generate(quality='low')
-
-    def on_motion(self, event):
-        if self.dragging_idx >= 0 and event.inaxes == self.ax:
-            if event.xdata is None or event.ydata is None:
-                return
-            self.foci[self.dragging_idx][:2] = [event.xdata, event.ydata]
-            self.update_foci_ui()
-            self.generate(quality='low')
-
-    def on_release(self, event):
-        if self.dragging_idx >= 0:
-            self.dragging_idx = -1
-            if self.mode == '2D':
-                self.generate(quality='high')
-
-    def update_foci_ui(self):
-        self.clear_artists(self.focus_artists)
-        
-        for i, (x, y, s) in enumerate(self.foci):
-            c = '#1f77b4' if s > 0 else '#d62728'
-            label = f"F{i+1}{'+' if s > 0 else '-'}"
-            
-            if self.mode == '2D':
-                scat = self.ax.scatter(x, y, c=c, s=100, edgecolors='white', zorder=10)
-                txt = self.ax.text(x, y + 0.6, label, color=c, ha='center', fontweight='bold', fontsize=10)
-                self.focus_artists.extend([scat, txt])
-            elif self.mode == '3D Constant':
-                scat = self.ax.scatter([x], [y], [0], c=c, s=120, edgecolors='white', depthshade=False)
-                txt = self.ax.text(x, y, 0.8, label, color=c, fontweight='bold')
-                self.focus_artists.extend([scat, txt])
-            else:  # 3D Variable
-                line, = self.ax.plot([x, x], [y, y], [-10, 10], c=c, ls='--', lw=2, alpha=0.7)
-                txt = self.ax.text(x, y, 10.5, label, color=c, fontweight='bold')
-                self.focus_artists.extend([line, txt])
-        
-        self.fig.canvas.draw_idle()
-
-    def _update_metric_sliders_visibility(self):
-        """Show/hide metric-specific sliders based on selected metric."""
-        # Minkowski slider
-        is_minkowski = (self.metric == 'Minkowski')
-        self.ax_p.set_visible(is_minkowski)
-        self.s_p.set_active(is_minkowski)
-        
-        # Angular sliders
-        is_angular = (self.metric == 'Angular')
-        self.ax_angular_n.set_visible(is_angular)
-        self.ax_angular_a.set_visible(is_angular)
-        self.s_angular_n.set_active(is_angular)
-        self.s_angular_a.set_active(is_angular)
-        
-        self.fig.canvas.draw_idle()
-
-    def _init_ui(self):
-        """Initialize UI elements."""
-        # Mode selector
-        self.ax_mode = self.fig.add_axes([0.02, 0.78, 0.12, 0.12], facecolor='#f8f8f8')
-        self.r_mode = RadioButtons(self.ax_mode, ('2D', '3D Constant', '3D Variable'), active=0)
-        self.r_mode.on_clicked(self._change_mode)
-        
-        # Metric selector
-        self.ax_met = self.fig.add_axes([0.02, 0.55, 0.12, 0.18], facecolor='#f8f8f8')
-        self.r_met = RadioButtons(self.ax_met, ('Euclidean', 'Manhattan', 'Chebyshev', 'Minkowski', 'Angular'), active=0)
-        self.r_met.on_clicked(self._change_metric)
-        
-        # Buttons
-        ax_auto = self.fig.add_axes([0.02, 0.46, 0.12, 0.05])
-        self.b_auto = Button(ax_auto, 'Auto Constant', color='#e1f5fe')
-        self.b_auto.on_clicked(self.auto_constant)
-        
-        ax_gen = self.fig.add_axes([0.2, 0.05, 0.14, 0.05])
-        self.b_gen = Button(ax_gen, 'Generate High-Res', color='#f1f8e9')
-        self.b_gen.on_clicked(lambda e: self.generate(quality='high'))
-        
-        ax_clr = self.fig.add_axes([0.35, 0.05, 0.08, 0.05])
-        self.b_clr = Button(ax_clr, 'Clear All', color='#ffebee')
-        self.b_clr.on_clicked(self._clear_all)
-        
-        # Main constant slider
-        ax_const = self.fig.add_axes([0.5, 0.07, 0.3, 0.03])
-        self.s_const = Slider(ax_const, 'Constant (K)', 0.1, 25, valinit=5)
-        self.s_const.on_changed(lambda v: self.generate(quality='low'))
-        
-        # === METRIC-SPECIFIC SLIDERS ===
-        
-        # Minkowski P slider 
-        self.ax_p = self.fig.add_axes([0.02, 0.40, 0.12, 0.03])
-        self.s_p = Slider(self.ax_p, 'P', 1.0, 10.0, valinit=self.p_val, color='#ffcc80')
-        self.s_p.on_changed(self._change_p)
-        self.ax_p.set_visible(False)
-        
-        # Angular N slider 
-        self.ax_angular_n = self.fig.add_axes([0.02, 0.34, 0.12, 0.03])
-        self.s_angular_n = Slider(self.ax_angular_n, 'Petals', 1, 12, valinit=self.angular_n, valstep=1, color='#ce93d8')
-        self.s_angular_n.on_changed(self._change_angular_n)
-        self.ax_angular_n.set_visible(False)
-        
-        # Angular A slider 
-        self.ax_angular_a = self.fig.add_axes([0.02, 0.28, 0.12, 0.03])
-        self.s_angular_a = Slider(self.ax_angular_a, 'Amplitude', 0.05, 0.95, valinit=self.angular_a, color='#ce93d8')
-        self.s_angular_a.on_changed(self._change_angular_a)
-        self.ax_angular_a.set_visible(False)
-
-    def _change_mode(self, label):
-        self.mode = label
-        self._switch_axes()
-
-    def _change_metric(self, label):
-        self.metric = label
-        self._update_metric_sliders_visibility()
-        self.ax.set_title(f"Metric: {label}")
-        self.generate(quality='high')
-
-    def _change_p(self, val):
-        self.p_val = val
-        if self.metric == 'Minkowski':
-            self.generate(quality='low')
-
-    def _change_angular_n(self, val):
-        self.angular_n = int(val)
-        if self.metric == 'Angular':
-            self.generate(quality='low')
-
-    def _change_angular_a(self, val):
-        self.angular_a = val
-        if self.metric == 'Angular':
-            self.generate(quality='low')
-
-    def _clear_all(self, event):
-        self.foci = []
-        self.clear_artists(self.curve_artists)
-        self.clear_artists(self.preview_artists)
-        self.clear_artists(self.focus_artists)
-        self.fig.canvas.draw_idle()
-
-
-if __name__ == '__main__':
-    print("=" * 60)
-    print("Ultimate Conics Generator")
-    print("=" * 60)
-    print()
-    print("MODES:")
-    print("  • 2D: Classic curves (circles, ellipses, hyperbolas)")
-    print("  • 3D Constant: Surfaces where Σ(sign×dist) = K")
-    print("  • 3D Variable: Surfaces where Σ(sign×dist) = z (cones!)")
-    print()
-    print("METRICS:")
-    print("  • Euclidean: √(dx² + dy²) → circles, spheres")
-    print("  • Manhattan: |dx| + |dy| → diamonds, octahedra")
-    print("  • Chebyshev: max(|dx|, |dy|) → squares, cubes")
-    print("  • Minkowski: (|dx|^p + |dy|^p)^(1/p)")
-    print("      - P=1: Manhattan, P=2: Euclidean, P→∞: Chebyshev")
-    print("  • Angular: r × (1 + a·cos(n·θ)) → stars, roses")
-    print("      - N: number of petals (1-12)")
-    print("      - A: amplitude (pointiness)")
-    print()
-    print("CONTROLS:")
-    print("  • Left-click: Add focus (+)")
-    print("  • Right-click on focus: Toggle +/−")
-    print("  • Drag focus: Move it")
-    print("  • Generate High-Res: Render final curve/surface")
-    print("=" * 60)
+    # Compute Field
+    l = np.linspace(-10.5, 10.5, resolution)
+    X, Y = np.meshgrid(l, l)
+    field = compute_field_2d(foci, X, Y, metric, p_val, angular_n, angular_a)
     
-    app = UltimateConicsApp()
+    levels = sorted([constant, -constant]) if any(f[2] < 0 for f in foci) else [constant]
+    colors = ['#2ca02c', '#9467bd'] # Green, Purple
+    
+    # Use matplotlib (headless) to calculate contour paths accurately
+    try:
+        temp_fig, temp_ax = plt.subplots()
+        cs = temp_ax.contour(X, Y, field, levels=levels)
+        all_segs = cs.allsegs
+        plt.close(temp_fig)
+
+        for i, level_segs in enumerate(all_segs):
+            color = colors[i % len(colors)]
+            for seg in level_segs:
+                traces.append(go.Scatter(
+                    x=seg[:, 0], y=seg[:, 1],
+                    mode='lines',
+                    line=dict(color=color, width=3),
+                    hoverinfo='skip', # Important: Let clicks pass through lines
+                    name=f'Level {levels[i]:.2f}'
+                ))
+    except Exception as e:
+        print(f"Contour generation error: {e}")
+        
+    return traces
+
+def get_3d_mesh_trace(foci, constant, metric, p_val, angular_n, angular_a, resolution, mode):
+    """Generates a Plotly Mesh3d trace for the 3D surface."""
+    if not foci or not HAS_SKIMAGE: return None, []
+    
+    # Range is expanded to [-20, 20] to accommodate larger K constants
+    RANGE = 20.0
+    l = np.linspace(-RANGE, RANGE, resolution)
+    X, Y, Z = np.meshgrid(l, l, l, indexing='ij')
+    field = compute_field_3d(foci, X, Y, Z, metric, p_val, angular_n, angular_a, mode)
+    target = field if mode == '3D Constant' else field - Z
+    
+    # Determine levels
+    iso_levels = sorted([constant, -constant]) if (mode=='3D Constant' and any(f[2]<0 for f in foci)) else ([constant] if mode=='3D Constant' else [0])
+    
+    meshes = []
+    debug_logs = []
+
+    for i, iso in enumerate(iso_levels):
+        # 1. Pre-check: Does the field even cross the iso level?
+        min_val, max_val = target.min(), target.max()
+        if iso < min_val or iso > max_val:
+            debug_logs.append(f"Skipping Iso {iso:.2f}: Value out of range [{min_val:.2f}, {max_val:.2f}]")
+            continue
+
+        try:
+            # 2. Try Generating Surface
+            # Try newer API first, then fallback to older 'lewiner' if needed
+            if hasattr(measure, 'marching_cubes'):
+                result = measure.marching_cubes(target, iso)
+            elif hasattr(measure, 'marching_cubes_lewiner'):
+                result = measure.marching_cubes_lewiner(target, iso)
+            else:
+                debug_logs.append("No valid marching_cubes function found in skimage.measure")
+                continue
+
+            # Robust unpacking
+            if len(result) >= 2:
+                verts = result[0]
+                faces = result[1]
+            else:
+                continue
+            
+            # 3. Map Coordinates
+            # Robustly map index coordinates back to spatial coordinates (-RANGE to RANGE)
+            max_idx = resolution - 1
+            width = 2 * RANGE
+            x = (verts[:, 0] / max_idx) * width - RANGE
+            y = (verts[:, 1] / max_idx) * width - RANGE
+            z = (verts[:, 2] / max_idx) * width - RANGE
+            
+            # Match colors to 2D plot (Green for first level, Purple for second)
+            mesh_color = '#2ca02c' if i == 0 else '#9467bd'
+            
+            meshes.append(go.Mesh3d(
+                x=x, y=y, z=z,
+                i=faces[:, 0], j=faces[:, 1], k=faces[:, 2],
+                opacity=0.6,
+                color=mesh_color,
+                flatshading=True,
+                name=f'Iso {iso:.2f}',
+                hoverinfo='name'
+            ))
+        except RuntimeError as re:
+            # "No surface found at the given iso value"
+            debug_logs.append(f"Iso {iso:.2f}: {str(re)}")
+            continue
+        except Exception as e:
+            debug_logs.append(f"Error on Iso {iso:.2f}: {str(e)}")
+            continue
+        
+    return meshes, debug_logs
+
+# ==================== STREAMLIT UI ====================
+
+with st.sidebar:
+    # Move Title to sidebar to keep main area top-aligned with chart
+    st.title("Ultimate Conics Generator")
+    st.info(f"Mode: **{mode if 'mode' in locals() else '2D'}** — Click on the grid to add foci points.")
+
+    st.header("Settings")
+    mode = st.radio("Mode", ['2D', '3D Constant', '3D Variable'])
+    st.divider()
+    metric = st.radio("Distance Metric", ['Euclidean', 'Manhattan', 'Chebyshev', 'Minkowski', 'Angular'])
+    
+    p_val, ang_n, ang_a = 2.0, 3, 0.3
+    if metric == 'Minkowski': p_val = st.slider("P (Minkowski)", 1.0, 6.0, 2.0)
+    if metric == 'Angular':
+        ang_n = st.slider("Petals (n)", 1, 10, 3)
+        ang_a = st.slider("Amplitude (a)", 0.1, 0.9, 0.3)
+    
+    st.divider()
+    st.session_state.k_val = st.slider("Constant (K)", 0.1, 25.0, float(st.session_state.k_val))
+    
+    if st.button("🎯 Auto Constant"):
+        st.session_state.k_val = auto_constant(st.session_state.foci)
+        st.rerun()
+    
+    res = st.slider("Resolution", 100, 500, 300) if mode == '2D' else st.slider("Resolution (3D)", 20, 80, 40)
+    if st.button("🗑️ Clear Foci", type="primary"):
+        st.session_state.foci = []
+        st.rerun()
+        
+    # --- MOVED FOCI LIST TO SIDEBAR TO PREVENT MAIN SCROLL JUMPING ---
+    if st.session_state.foci:
+        st.divider()
+        st.write("### Active Foci")
+        # Use a simpler layout in sidebar
+        for i, (fx, fy, s) in enumerate(st.session_state.foci):
+            c1, c2, c3 = st.columns([2, 1, 1])
+            c1.write(f"**F{i+1}** ({fx:.1f}, {fy:.1f})")
+            if c2.button("±", key=f"toggle_{i}"): 
+                st.session_state.foci[i][2] *= -1
+                st.rerun()
+            if c3.button("x", key=f"delete_{i}"):
+                st.session_state.foci.pop(i)
+                st.rerun()
+
+# ==================== MAIN GRAPH LOGIC ====================
+
+# 1. EARLY EVENT PROCESSING (Prevents Flashing)
+if "main_graph" in st.session_state:
+    event = st.session_state.main_graph
+    if event and "selection" in event:
+        points = event["selection"].get("points", [])
+        
+        valid_point = None
+        for p in reversed(points):
+            try:
+                px = float(p.get('x'))
+                py = float(p.get('y'))
+                valid_point = (px, py)
+                break
+            except (TypeError, ValueError):
+                continue
+        
+        if valid_point:
+            new_x, new_y = valid_point
+            if not any(np.isclose(f[0], new_x, atol=0.15) and np.isclose(f[1], new_y, atol=0.15) for f in st.session_state.foci):
+                st.session_state.foci.append([new_x, new_y, 1])
+
+
+# 2. GENERATE FIGURE (Using Updated State)
+fig = go.Figure()
+
+# Setup Sensor Grid
+if mode == '2D':
+    grid_pts = np.arange(-10, 10.5, 0.5)
+else:
+    # Use a wider sensor grid for 3D visual context, but keep 0.5 step for clicking
+    grid_pts = np.arange(-10, 10.5, 0.5)
+
+gx, gy = np.meshgrid(grid_pts, grid_pts)
+
+if mode == '2D':
+    # 2D Sensor
+    fig.add_trace(go.Scatter(
+        x=gx.flatten(), y=gy.flatten(),
+        mode='markers',
+        marker=dict(color='rgba(0,0,0,0.01)', size=22, symbol='square'),
+        hoverinfo='none',
+        name='sensor'
+    ))
+    
+    if st.session_state.foci:
+        geom_traces = get_2d_contour_traces(st.session_state.foci, st.session_state.k_val, metric, p_val, ang_n, ang_a, res)
+        for t in geom_traces:
+            fig.add_trace(t)
+
+    for i, (fx, fy, s) in enumerate(st.session_state.foci):
+        color = '#1f77b4' if s > 0 else '#d62728'
+        fig.add_trace(go.Scatter(
+            x=[fx], y=[fy],
+            mode='markers+text',
+            text=[f"F{i+1}"],
+            textposition="top center",
+            marker=dict(color=color, size=15, line=dict(width=2, color='white')),
+            name=f"F{i+1}",
+            hoverinfo='text'
+        ))
+        
+    fig.update_layout(
+        xaxis=dict(range=[-10.5, 10.5], fixedrange=True, zeroline=True, gridcolor='lightgray'),
+        yaxis=dict(range=[-10.5, 10.5], fixedrange=True, scaleanchor="x", zeroline=True, gridcolor='lightgray'),
+        width=700, height=700,
+        margin=dict(l=0,r=0,t=0,b=0),
+        showlegend=False,
+        plot_bgcolor='white',
+        clickmode='event+select',
+        dragmode='pan',
+        uirevision='constant' # Keeps zoom/pan state when data updates
+    )
+
+else:
+    # 3D Sensor
+    fig.add_trace(go.Scatter3d(
+        x=gx.flatten(), y=gy.flatten(), z=np.zeros_like(gx.flatten()),
+        mode='markers',
+        marker=dict(color='rgba(0,0,0,0.01)', size=10, symbol='square'),
+        hoverinfo='none',
+        name='sensor'
+    ))
+    
+    # 3D Geometry Traces
+    debug_info = []
+    if st.session_state.foci:
+        meshes, debug_info = get_3d_mesh_trace(st.session_state.foci, st.session_state.k_val, metric, p_val, ang_n, ang_a, res, mode)
+        if meshes:
+            for m in meshes:
+                fig.add_trace(m)
+        elif not HAS_SKIMAGE:
+            st.sidebar.error("scikit-image is required for 3D visualization.")
+        else:
+            # If no meshes but we have logs, user needs to know why
+            # Move warning to sidebar to avoid layout shift in main area
+            st.sidebar.warning("No surface geometry found within the bounds.")
+
+    if debug_info:
+        with st.sidebar.expander("Debug: 3D Generation Logs"):
+            for log in debug_info:
+                st.write(f"- {log}")
+
+    # 3D Foci
+    for i, (fx, fy, s) in enumerate(st.session_state.foci):
+        color = '#1f77b4' if s > 0 else '#d62728'
+        if mode == '3D Constant':
+            fig.add_trace(go.Scatter3d(
+                x=[fx], y=[fy], z=[0],
+                mode='markers+text',
+                text=[f"F{i+1}"],
+                marker=dict(color=color, size=8, line=dict(width=2, color='white')),
+                name=f"F{i+1}"
+            ))
+        else:
+            fig.add_trace(go.Scatter3d(
+                x=[fx, fx], y=[fy, fy], z=[-10, 10],
+                mode='lines',
+                line=dict(color=color, dash='dash', width=4),
+                name=f"F{i+1}"
+            ))
+
+    fig.update_layout(
+        scene=dict(
+            xaxis=dict(range=[-20, 20]),
+            yaxis=dict(range=[-20, 20]),
+            zaxis=dict(range=[-20, 20]),
+            aspectmode='cube'
+        ),
+        width=800, height=800,
+        margin=dict(l=0,r=0,t=0,b=0),
+        showlegend=False,
+        clickmode='event+select',
+        dragmode='turntable',
+        uirevision='constant' # Keeps camera rotation when data updates
+    )
+
+# 3. RENDER CHART
+# Using a container to reserve space and stabilize layout
+with st.container():
+    st.plotly_chart(
+        fig, 
+        use_container_width=True, 
+        on_select="rerun", 
+        selection_mode="points", 
+        key="main_graph",
+        config={'displayModeBar': True}
+    )
