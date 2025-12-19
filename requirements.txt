@@ -1,4 +1,5 @@
 streamlit
 numpy
 matplotlib
+plotly
 scikit-image
